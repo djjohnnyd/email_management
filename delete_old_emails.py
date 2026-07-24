@@ -1,64 +1,98 @@
 """
-delete_old_emails.py
---------------------
-Connects to a GoDaddy (Outlook/Microsoft 365) mailbox via IMAP and deletes
+delete_old_emails.py  (OAuth2 version for Microsoft 365 / GoDaddy M365)
+------------------------------------------------------------------------
+Connects via IMAP using OAuth2 (no plain password needed) and deletes
 emails that meet ALL of the following criteria:
   1. Have at least one attachment
-  2. Are older than 10 years
+  2. Are older than 10 years (configurable)
 
 SAFETY: Run with DRY_RUN = True first to preview what would be deleted.
-        Set DRY_RUN = False only when you're confident in the results.
 
 Requirements:
-    pip install python-dotenv
+    pip install msal python-dotenv
 
 Setup:
-    Create a file named .env in the same folder as this script with:
-        EMAIL=you@yourdomain.com
-        PASSWORD=your_app_password_or_email_password
-
-    GoDaddy IMAP settings:
-        Host: imap.secureserver.net (or outlook.office365.com for M365)
-        Port: 993
-        SSL:  Yes
+    1. Register an Azure App (see README in comments below).
+    2. Create a .env file with CLIENT_ID, TENANT_ID, and EMAIL.
+       Or just fill in the config section below directly.
 """
 
 import imaplib
 import email
-from email.header import decode_header
+import base64
 import datetime
 import os
 import sys
+from email.header import decode_header
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION — edit these or use a .env file
+# CONFIGURATION — fill these in or put them in a .env file
 # ---------------------------------------------------------------------------
 
 EMAIL_ADDRESS = os.environ.get("EMAIL", "you@yourdomain.com")
-EMAIL_PASSWORD = os.environ.get("PASSWORD", "your_password_here")
 
-# GoDaddy legacy hosting uses imap.secureserver.net
-# GoDaddy Microsoft 365 accounts use outlook.office365.com
-IMAP_HOST = "imap.secureserver.net"   # Change to outlook.office365.com if needed
+# From your Azure App Registration:
+CLIENT_ID  = os.environ.get("CLIENT_ID",  "your-client-id-here")
+TENANT_ID  = os.environ.get("TENANT_ID",  "your-tenant-id-here")
+
+IMAP_HOST = "outlook.office365.com"
 IMAP_PORT = 993
 
-# Folders to scan. Use "INBOX" for inbox only, or add more like "Sent"
-FOLDERS_TO_SCAN = ["INBOX", "Sent"]
+# Folders to scan (use exact names; common ones listed)
+FOLDERS_TO_SCAN = ["INBOX", "Sent Items"]
 
-# How many years old an email must be to qualify for deletion
+# Delete emails older than this many years
 YEARS_OLD = 10
 
-# ⚠️  SAFETY SWITCH: Set to False only when ready to actually delete
+# ⚠️  SAFETY: Set to False only when ready to actually delete
 DRY_RUN = True
 
-# How many emails to process per folder (None = all). Useful for testing.
+# Limit per folder for test runs (None = unlimited)
 LIMIT_PER_FOLDER = None   # e.g. 50 for a test run
 
 # ---------------------------------------------------------------------------
 
 
+def get_oauth2_token(client_id, tenant_id, email_address):
+    """Interactively authenticate with Microsoft and return an access token."""
+    try:
+        import msal
+    except ImportError:
+        print("ERROR: msal not installed. Run:  pip install msal")
+        sys.exit(1)
+
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    scopes = ["https://outlook.office.com/IMAP.AccessAsUser.All", "offline_access"]
+
+    app = msal.PublicClientApplication(client_id, authority=authority)
+
+    # Try silent (cached) token first
+    accounts = app.get_accounts(username=email_address)
+    result = None
+    if accounts:
+        result = app.acquire_token_silent(scopes, account=accounts[0])
+
+    if not result:
+        # Open browser for interactive login
+        print("\nA browser window will open for you to sign in to Microsoft 365.")
+        print("After signing in, return here.\n")
+        result = app.acquire_token_interactive(scopes=scopes, login_hint=email_address)
+
+    if "access_token" not in result:
+        print(f"Authentication failed: {result.get('error_description', result)}")
+        sys.exit(1)
+
+    print("Authentication successful.\n")
+    return result["access_token"]
+
+
+def build_xoauth2_string(email_address, access_token):
+    """Build the XOAUTH2 authentication string for IMAP."""
+    auth_string = f"user={email_address}\x01auth=Bearer {access_token}\x01\x01"
+    return base64.b64encode(auth_string.encode()).decode()
+
+
 def decode_str(s):
-    """Decode an email header string to plain text."""
     if s is None:
         return ""
     parts = decode_header(s)
@@ -67,44 +101,40 @@ def decode_str(s):
         if isinstance(part, bytes):
             decoded.append(part.decode(charset or "utf-8", errors="replace"))
         else:
-            decoded.append(part)
+            decoded.append(str(part))
     return " ".join(decoded)
 
 
 def has_attachment(msg):
-    """Return True if the email message has at least one attachment."""
     if msg.is_multipart():
         for part in msg.walk():
-            disposition = part.get("Content-Disposition", "")
+            disposition = str(part.get("Content-Disposition", ""))
             if "attachment" in disposition.lower():
                 return True
-            # Some attachments have a filename but no explicit disposition
             if part.get_filename():
                 return True
     return False
 
 
-def get_cutoff_date(years=10):
-    """Return the cutoff date (today minus N years) formatted for IMAP SEARCH."""
+def get_cutoff_date_str(years=10):
     today = datetime.date.today()
     try:
         cutoff = today.replace(year=today.year - years)
     except ValueError:
-        # Feb 29 edge case
         cutoff = today.replace(year=today.year - years, day=28)
-    # IMAP BEFORE date format: DD-Mon-YYYY (e.g. 27-May-2015)
     return cutoff.strftime("%d-%b-%Y")
 
 
 def process_folder(mail, folder, cutoff_date_str, dry_run, limit):
-    """Search a folder and delete qualifying emails."""
+    try:
+        status, _ = mail.select(f'"{folder}"', readonly=dry_run)
+    except Exception:
+        status, _ = mail.select(folder, readonly=dry_run)
 
-    status, _ = mail.select(folder, readonly=dry_run)
     if status != "OK":
-        print(f"  [!] Could not open folder: {folder}")
+        print(f"  [!] Could not open folder: {folder} — skipping")
         return 0, 0
 
-    # Search for all emails BEFORE the cutoff date
     status, data = mail.search(None, f'(BEFORE "{cutoff_date_str}")')
     if status != "OK":
         print(f"  [!] Search failed in {folder}")
@@ -121,7 +151,6 @@ def process_folder(mail, folder, cutoff_date_str, dry_run, limit):
     deleted = 0
 
     for msg_id in all_ids:
-        # Fetch the full message to inspect for attachments
         status, msg_data = mail.fetch(msg_id, "(RFC822)")
         if status != "OK":
             continue
@@ -133,19 +162,17 @@ def process_folder(mail, folder, cutoff_date_str, dry_run, limit):
         if not has_attachment(msg):
             continue
 
-        # This email matches both criteria
-        subject = decode_str(msg.get("Subject", "(no subject)"))
+        subject  = decode_str(msg.get("Subject", "(no subject)"))
         date_str = msg.get("Date", "(unknown date)")
-        sender = decode_str(msg.get("From", "(unknown sender)"))
-
+        sender   = decode_str(msg.get("From", "(unknown)"))
         deleted += 1
+
         if dry_run:
-            print(f"  [DRY RUN] Would delete: | {date_str[:22]} | From: {sender[:40]} | {subject[:60]}")
+            print(f"  [DRY RUN] Would delete | {date_str[:22]} | {sender[:35]} | {subject[:55]}")
         else:
             mail.store(msg_id, "+FLAGS", "\\Deleted")
-            print(f"  [DELETED] | {date_str[:22]} | From: {sender[:40]} | {subject[:60]}")
+            print(f"  [DELETED]              | {date_str[:22]} | {sender[:35]} | {subject[:55]}")
 
-    # Permanently expunge deleted messages
     if not dry_run and deleted > 0:
         mail.expunge()
 
@@ -153,66 +180,77 @@ def process_folder(mail, folder, cutoff_date_str, dry_run, limit):
 
 
 def main():
-    # Try to load .env if python-dotenv is available
+    # Load .env if available
     try:
         from dotenv import load_dotenv
         load_dotenv()
-        global EMAIL_ADDRESS, EMAIL_PASSWORD
+        global EMAIL_ADDRESS, CLIENT_ID, TENANT_ID
         EMAIL_ADDRESS = os.environ.get("EMAIL", EMAIL_ADDRESS)
-        EMAIL_PASSWORD = os.environ.get("PASSWORD", EMAIL_PASSWORD)
+        CLIENT_ID     = os.environ.get("CLIENT_ID", CLIENT_ID)
+        TENANT_ID     = os.environ.get("TENANT_ID", TENANT_ID)
     except ImportError:
-        pass  # dotenv not installed; fall back to hardcoded values
+        pass
 
-    if "your_password_here" in EMAIL_PASSWORD or "yourdomain.com" in EMAIL_ADDRESS:
-        print("ERROR: Please set your EMAIL and PASSWORD in this script or in a .env file.")
+    # Validate config
+    missing = []
+    if "yourdomain.com" in EMAIL_ADDRESS or not EMAIL_ADDRESS:
+        missing.append("EMAIL")
+    if "your-client-id" in CLIENT_ID or not CLIENT_ID:
+        missing.append("CLIENT_ID")
+    if "your-tenant-id" in TENANT_ID or not TENANT_ID:
+        missing.append("TENANT_ID")
+    if missing:
+        print(f"ERROR: Please set the following in your .env or in the script: {', '.join(missing)}")
         sys.exit(1)
 
-    cutoff_date_str = get_cutoff_date(YEARS_OLD)
-    mode = "DRY RUN (no emails will be deleted)" if DRY_RUN else "⚠️  LIVE RUN — emails WILL be permanently deleted"
+    cutoff_date_str = get_cutoff_date_str(YEARS_OLD)
+    mode = "DRY RUN (nothing will be deleted)" if DRY_RUN else "⚠️  LIVE — emails WILL be permanently deleted"
 
     print("=" * 70)
-    print(f"  Email:    {EMAIL_ADDRESS}")
-    print(f"  Server:   {IMAP_HOST}:{IMAP_PORT}")
-    print(f"  Cutoff:   Emails before {cutoff_date_str} ({YEARS_OLD} years ago)")
-    print(f"  Criteria: Has attachment AND older than {YEARS_OLD} years")
-    print(f"  Mode:     {mode}")
+    print(f"  Email:   {EMAIL_ADDRESS}")
+    print(f"  Cutoff:  Before {cutoff_date_str} ({YEARS_OLD} years ago)")
+    print(f"  Folders: {', '.join(FOLDERS_TO_SCAN)}")
+    print(f"  Mode:    {mode}")
     print("=" * 70)
 
+    # Get OAuth2 token (opens browser if no cached token)
+    access_token = get_oauth2_token(CLIENT_ID, TENANT_ID, EMAIL_ADDRESS)
+    xoauth2_str  = build_xoauth2_string(EMAIL_ADDRESS, access_token)
+
+    # Connect via IMAP
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        print(f"\nLogged in successfully.\n")
+        mail.authenticate("XOAUTH2", lambda x: xoauth2_str)
+        print("Connected to IMAP server.\n")
     except imaplib.IMAP4.error as e:
-        print(f"Login failed: {e}")
-        print("\nTroubleshooting tips:")
-        print("  - For GoDaddy legacy hosting: host should be imap.secureserver.net")
-        print("  - For GoDaddy M365:           host should be outlook.office365.com")
-        print("  - If using M365, you may need an App Password (see README below)")
+        print(f"\nIMAP connection/auth failed: {e}")
+        print("\nThings to check:")
+        print("  1. IMAP is enabled for your mailbox in Outlook settings")
+        print("  2. Your Azure app has the IMAP.AccessAsUser.All permission")
+        print("  3. Admin consent was granted for that permission")
         sys.exit(1)
 
     total_checked = 0
     total_deleted = 0
 
     for folder in FOLDERS_TO_SCAN:
-        print(f"\nScanning folder: {folder}")
+        print(f"Scanning: {folder}")
         checked, deleted = process_folder(
             mail, folder, cutoff_date_str, DRY_RUN, LIMIT_PER_FOLDER
         )
         total_checked += checked
         total_deleted += deleted
-        print(f"  → Checked: {checked} | {'Would delete' if DRY_RUN else 'Deleted'}: {deleted}")
+        action = "Would delete" if DRY_RUN else "Deleted"
+        print(f"  → Checked: {checked}  |  {action}: {deleted}\n")
 
     mail.logout()
 
-    print("\n" + "=" * 70)
-    print(f"  SUMMARY")
-    print(f"  Total emails checked:  {total_checked}")
-    action = "Would be deleted" if DRY_RUN else "Deleted"
+    print("=" * 70)
+    print(f"  Total checked:  {total_checked}")
+    action = "Would be deleted" if DRY_RUN else "Permanently deleted"
     print(f"  {action}: {total_deleted}")
     if DRY_RUN:
-        print("\n  ✓ This was a DRY RUN. Set DRY_RUN = False to perform actual deletion.")
-    else:
-        print("\n  ✓ Deletion complete. Emails have been permanently removed.")
+        print("\n  ✓ DRY RUN complete. Set DRY_RUN = False to actually delete.")
     print("=" * 70)
 
 
