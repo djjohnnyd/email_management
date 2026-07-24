@@ -73,10 +73,18 @@ def get_oauth2_token(client_id, tenant_id, email_address):
         result = app.acquire_token_silent(scopes, account=accounts[0])
 
     if not result:
-        # Open browser for interactive login
-        print("\nA browser window will open for you to sign in to Microsoft 365.")
-        print("After signing in, return here.\n")
-        result = app.acquire_token_interactive(scopes=scopes, login_hint=email_address)
+        # Device code flow — works over SSH with no display
+        flow = app.initiate_device_flow(scopes=scopes)
+        if "user_code" not in flow:
+            print(f"Failed to create device flow: {flow}")
+            sys.exit(1)
+        print("\n" + "=" * 60)
+        print("  ACTION REQUIRED — Sign in on your local machine:")
+        print(f"  1. Open this URL in your browser: {flow['verification_uri']}")
+        print(f"  2. Enter this code:               {flow['user_code']}")
+        print("=" * 60 + "\n")
+        # Waits here until you complete login in the browser (up to 15 min)
+        result = app.acquire_token_by_device_flow(flow)
 
     if "access_token" not in result:
         print(f"Authentication failed: {result.get('error_description', result)}")
@@ -256,3 +264,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
