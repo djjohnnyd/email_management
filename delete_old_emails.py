@@ -62,7 +62,7 @@ def get_oauth2_token(client_id, tenant_id, email_address):
         sys.exit(1)
 
     authority = f"https://login.microsoftonline.com/{tenant_id}"
-    scopes = ["https://outlook.office.com/IMAP.AccessAsUser.All"]
+    scopes = ["https://outlook.office.com/IMAP.AccessAsUser.All", "offline_access"]
 
     app = msal.PublicClientApplication(client_id, authority=authority)
 
@@ -264,4 +264,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
